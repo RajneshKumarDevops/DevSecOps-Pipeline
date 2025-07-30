@@ -1,0 +1,205 @@
+name: Secure CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+
+env:
+  IMAGE_NAME: rajneshyadav/nodejs-app
+  REGISTRY: docker.io
+  GITOPS_REPO: git@github.com:RajneshKumarDevops/GitOps.git
+  K8S_NAMESPACE: app-ns
+  ARGOCD_APP_NAME: nodejs-app
+  VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
+
+jobs:
+  build-test-scan-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Vault Login using AppRole
+        id: vault-login
+        uses: hashicorp/vault-action@v2
+        with:
+          url: ${{ env.VAULT_ADDR }}
+          method: approle
+          roleId: ${{ secrets.VAULT_ROLE_ID }}
+          secretId: ${{ secrets.VAULT_SECRET_ID }}
+          exportEnv: true
+          exportToken: true
+
+      - name: Read GitHub token from Vault
+        id: vault-github-token
+        uses: hashicorp/vault-action@v2
+        with:
+          url: ${{ env.VAULT_ADDR }}
+          method: token
+          token: ${{ env.VAULT_TOKEN }}
+          secrets: |
+            secret/github token
+
+      - name: Set image tag
+        run: echo "IMAGE_TAG=$(date +%Y%m%d)-$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Install SonarScanner
+        run: |
+          wget https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-5.0.1.3006-linux.zip
+          unzip sonar-scanner-cli-5.0.1.3006-linux.zip
+          sudo mv sonar-scanner-5.0.1.3006-linux /opt/sonar-scanner
+          sudo ln -s /opt/sonar-scanner/bin/sonar-scanner /usr/local/bin/sonar-scanner
+
+      - name: Clear Sonar cache
+        run: rm -rf ~/.sonar/cache
+
+      - name: SonarQube Scan
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: |
+          sonar-scanner \
+            -Dsonar.projectKey=nodejs-app \
+            -Dsonar.sources=. \
+            -Dsonar.host.url=$SONAR_HOST_URL \
+            -Dsonar.token=$SONAR_TOKEN
+
+      - name: Dependency scan with Grype
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+          grype . -o table > grype-deps-report.txt
+          cat grype-deps-report.txt
+
+      - name: Security scan with Trivy (filesystem)
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+          trivy fs --scanners vuln --severity HIGH,CRITICAL --format table --output trivy-fs-report.txt .
+          cat trivy-fs-report.txt
+
+      - name: Build Docker Image
+        run: docker build -t $IMAGE_NAME:${{ env.IMAGE_TAG }} .
+
+      - name: Docker Login
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USER }}
+          password: ${{ secrets.DOCKER_PASS }}
+
+      - name: Scan Docker Image with Trivy
+        run: |
+          trivy image --timeout 10m --scanners vuln --severity HIGH,CRITICAL --format table --output trivy-report.txt $IMAGE_NAME:${{ env.IMAGE_TAG }}
+          cat trivy-report.txt
+
+      - name: Push Docker Image
+        run: docker push $IMAGE_NAME:${{ env.IMAGE_TAG }}
+
+      - name: Upload reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: |
+            grype-deps-report.txt
+            trivy-fs-report.txt
+            trivy-report.txt
+
+      - name: Setup GitOps SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.GITOPS_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+          eval "$(ssh-agent -s)"
+          ssh-add ~/.ssh/id_rsa
+
+      - name: Update Argo Rollout for Canary
+        run: |
+          git clone ${{ env.GITOPS_REPO }} gitops-repo
+          cd gitops-repo
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          yq eval -i '
+            .spec.template.spec.containers[0].image = "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" |
+            .spec.strategy.canary.steps = [
+              {"setWeight": 20},
+              {"pause": {"duration": "30s"}},
+              {"setWeight": 50},
+              {"pause": {"duration": "30s"}},
+              {"analysis": {
+                "templates": [{"templateName": "success-rate"}],
+                "args": [{"name": "service-name", "value": "nodejs-app"}]
+              }},
+              {"setWeight": 100}
+            ]
+          ' k8s/rollout.yml
+          git add .
+          git diff --quiet && git diff --staged --quiet || git commit -m "Canary deploy ${{ env.IMAGE_TAG }} [skip ci]"
+          git push origin main
+
+      - name: Setup Kubernetes access
+        run: |
+          mkdir -p ~/.kube
+          cat <<EOF > ~/.kube/config
+          apiVersion: v1
+          kind: Config
+          clusters:
+          - cluster:
+              insecure-skip-tls-verify: true
+              server: ${{ secrets.K8S_SERVER }}
+            name: github-cluster
+          contexts:
+          - context:
+              cluster: github-cluster
+              user: github-actions
+            name: github-context
+          current-context: github-context
+          users:
+          - name: github-actions
+            user:
+              token: ${{ secrets.K8S_TOKEN }}
+          EOF
+          
+          # Vérification de la connexion
+          kubectl cluster-info
+          kubectl get ns
+
+      - name: Install Argo Rollouts CLI
+        run: |
+          curl -LO https://github.com/argoproj/argo-rollouts/releases/latest/download/kubectl-argo-rollouts-linux-amd64
+          chmod +x kubectl-argo-rollouts-linux-amd64
+          sudo mv kubectl-argo-rollouts-linux-amd64 /usr/local/bin/kubectl-argo-rollouts
+
+      - name: Wait for rollout
+        run: |
+          echo "Waiting for rollout to be healthy..."
+          for i in {1..30}; do
+            echo -n "Check $i/30: "
+            if STATUS=$(kubectl get rollout nodejs-app -n app-ns -o jsonpath='{.status.conditions[?(@.type=="Healthy")].status}'); then
+              echo "Health status: $STATUS"
+              if [[ "$STATUS" == "True" ]]; then
+                echo "=== ROLLOUT DETAILS ==="
+                kubectl-argo-rollouts get rollout nodejs-app -n app-ns
+                echo "=== PODS STATUS ==="
+                kubectl get pods -n app-ns -l app=nodejs-app
+                echo "✅ Rollout is healthy"
+                exit 0
+              fi
+            else
+              echo "Error checking rollout status"
+              kubectl get events -n app-ns --field-selector involvedObject.name=nodejs-app --sort-by='.lastTimestamp'
+            fi
+            sleep 10
+          done
+
+          echo "❌ Rollout did not become healthy in time"
+          kubectl-argo-rollouts get rollout nodejs-app -n app-ns
+          exit 1
